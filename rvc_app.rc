@@ -1,0 +1,16 @@
+# /system/etc/init/rvc_app.rc
+#
+# Camera streaming daemon.
+# Watches vendor.rvc.camera.active and controls the Camera2 NDK +
+# AMediaCodec H.264 -> RTP/UDP pipeline.
+#
+# Started with class main so it is ready before rvc_service writes
+# the property for the first time.
+
+service rvc_app /system/bin/rvc_app
+    class main
+    user cameraserver
+    group camera inet
+    ioprio rt 4
+    writepid /dev/cpuset/camera-daemon/tasks
+    onrestart restart rvc_app

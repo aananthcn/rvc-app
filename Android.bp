@@ -1,0 +1,55 @@
+// ============================================================
+//  rvc_app — Camera streaming service (system binary)
+//
+//  Lives in /system/bin so it runs in the system linker
+//  namespace, where libcamera2ndk is accessible.
+//  Receives start/stop commands from rvc_service over a
+//  Unix domain socket (/dev/socket/rvc_ctrl).
+//
+//  Build with: mmm vendor/brcm/rvc-camera
+// ============================================================
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_binary {
+    name: "rvc_app",
+
+    srcs: [
+        "src/main.cpp",
+        "src/CameraStreamManager.cpp",
+        "src/RtpStreamer.cpp",
+    ],
+
+    local_include_dirs: ["include"],
+
+    shared_libs: [
+        // Android core
+        "liblog",
+        "libutils",
+        "libcutils",
+        "libbase",
+
+        // Camera
+        "libcamera2ndk",
+        "libmediandk",
+        "libnativewindow",
+
+        // Network (UDP socket — in libc, listed for clarity)
+        "libc",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-std=c++17",
+        "-DLOG_TAG=\"RvcApp\"",
+    ],
+
+    init_rc: ["rvc_app.rc"],
+
+    // No vendor: true — installs to /system/bin so libcamera2ndk
+    // is reachable via the system linker namespace.
+}

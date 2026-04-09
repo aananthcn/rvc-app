@@ -1,0 +1,19 @@
+# Domain for the camera streaming service (/system/bin/rvc_app)
+
+# coredomain: system binary — needed to exec from system_file_type
+type rvc_app,      domain, coredomain;
+# system_file_type: satisfies the coredomain entrypoint neverallow
+type rvc_app_exec, exec_type, system_file_type, file_type;
+
+# Allow init to spawn rvc_app and transition into its domain
+init_daemon_domain(rvc_app)
+
+# Camera HAL client (handles hwbinder + hwservice_manager internally)
+hal_client_domain(rvc_app, hal_camera)
+
+# UDP socket for RTP streaming
+allow rvc_app self:udp_socket { create connect write read };
+allow rvc_app node:udp_socket node_bind;
+
+# Read the vendor property written by rvc_service
+get_prop(rvc_app, vendor_rvc_prop)
