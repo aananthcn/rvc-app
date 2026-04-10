@@ -9,7 +9,7 @@
 namespace rearview {
 
 // ── Camera ───────────────────────────────────────────────────────────────────
-static constexpr const char* CAMERA_ID       = "0";
+static constexpr const char* CAMERA_ID       = "100";
 static constexpr int         VIDEO_WIDTH     = 1280;
 static constexpr int         VIDEO_HEIGHT    = 720;
 static constexpr int         CAPTURE_FPS     = 30;
@@ -22,6 +22,7 @@ static constexpr int         I_FRAME_INTERVAL = 1;          // IDR every 1 s
 // ── RTP / Network ────────────────────────────────────────────────────────────
 static constexpr const char* RTP_DEST_IP     = "192.168.10.10";
 static constexpr int         RTP_DEST_PORT   = 5004;
+static constexpr const char* RTP_LOCAL_IFACE = "eth0";      // SO_BINDTODEVICE forces eth0 egress
 static constexpr int         RTP_LOCAL_PORT  = 0;           // OS-assigned
 
 // RTP payload type for H.264 (RFC 6184)

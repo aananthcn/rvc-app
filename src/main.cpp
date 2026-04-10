@@ -1,3 +1,4 @@
+#include <android/binder_process.h>
 #include <log/log.h>
 #include <sys/system_properties.h>
 #include <signal.h>
@@ -26,6 +27,12 @@ static constexpr const char* RVC_PROP = "vendor.rvc.camera.active";
 int main() {
     signal(SIGTERM, signalHandler);
     signal(SIGINT,  signalHandler);
+
+    // Camera2 NDK delivers onCaptureCompleted / onImageAvailable via Binder
+    // callbacks into this process. Without a thread pool, CameraService has
+    // no thread to call into — all callbacks are silently dropped.
+    ABinderProcess_setThreadPoolMaxThreadCount(2);
+    ABinderProcess_startThreadPool();
 
     ALOGI("rvc_app: starting — watching property %s", RVC_PROP);
 

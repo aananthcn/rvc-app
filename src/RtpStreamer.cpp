@@ -39,6 +39,16 @@ bool RtpStreamer::start() {
         return false;
     }
 
+    // Force egress through eth0. Android policy routing (rule 31000) routes
+    // all untagged sockets through the wlan0 table regardless of source IP,
+    // so SO_BINDTODEVICE is the only reliable way to select the interface.
+    // Requires CAP_NET_RAW — granted to the 'system' user by Android.
+    if (::setsockopt(mSocket, SOL_SOCKET, SO_BINDTODEVICE,
+                     RTP_LOCAL_IFACE, strlen(RTP_LOCAL_IFACE) + 1) < 0) {
+        ALOGW("RtpStreamer: SO_BINDTODEVICE(%s) failed: %s",
+              RTP_LOCAL_IFACE, strerror(errno));
+    }
+
     std::memset(&mDestAddr, 0, sizeof(mDestAddr));
     mDestAddr.sin_family = AF_INET;
     mDestAddr.sin_port   = htons(static_cast<uint16_t>(RTP_DEST_PORT));
@@ -101,15 +111,80 @@ void RtpStreamer::sendAnnexB(const uint8_t* data, size_t size, int64_t presentat
     dispatchNal(size); // flush last NAL
 }
 
+// ── Parameter-set cache ───────────────────────────────────────────────────────
+// Walk an Annex-B buffer (typically the MediaCodec CODEC_CONFIG output) and
+// store the SPS and PPS NAL bodies so they can be injected before every IDR.
+
+void RtpStreamer::cacheParameterSets(const uint8_t* data, size_t size) {
+    size_t nalStart = 0;
+    bool   inNal    = false;
+
+    auto store = [&](size_t end) {
+        if (!inNal || end <= nalStart) return;
+        const uint8_t* nal = data + nalStart;
+        const size_t   len = end - nalStart;
+        const uint8_t  t   = len ? (nal[0] & 0x1F) : 0;
+        if      (t == 7) { mCachedSps.assign(nal, nal + len); }
+        else if (t == 8) { mCachedPps.assign(nal, nal + len); }
+    };
+
+    size_t i = 0;
+    while (i < size) {
+        const bool sc3 = (i + 2 < size) &&
+                         data[i]==0 && data[i+1]==0 && data[i+2]==1;
+        const bool sc4 = (i + 3 < size) &&
+                         data[i]==0 && data[i+1]==0 &&
+                         data[i+2]==0 && data[i+3]==1;
+        if (sc3 || sc4) {
+            store(i);
+            nalStart = i + (sc4 ? 4 : 3);
+            inNal    = true;
+            i        = nalStart;
+        } else {
+            ++i;
+        }
+    }
+    store(size);
+    ALOGI("RtpStreamer: cached SPS=%zu PPS=%zu bytes",
+          mCachedSps.size(), mCachedPps.size());
+}
+
 // ── Internal NAL dispatch ─────────────────────────────────────────────────────
+// RFC 3984 rules applied here:
+//  • SPS (type 7) / PPS (type 8): cache and suppress — they will be injected
+//    (with the correct RTP timestamp) immediately before the next IDR.
+//  • IDR (type 5): inject cached SPS+PPS first (marker=false), then send IDR.
+//  • All other slice NALs (type 1): send with marker=true (end of access unit).
+//  • Non-VCL NALs (SEI=6, AUD=9, …): send with marker=false.
 
 void RtpStreamer::sendNalUnit(const uint8_t* nal, size_t size, int64_t rtpTimestamp) {
     if (size == 0) return;
 
+    const uint8_t nalType = nal[0] & 0x1F;
+
+    // Parameter sets — update cache, do not send now.
+    if (nalType == 7) { mCachedSps.assign(nal, nal + size); return; }
+    if (nalType == 8) { mCachedPps.assign(nal, nal + size); return; }
+
+    // IDR: prepend cached SPS and PPS with the same RTP timestamp.
+    if (nalType == 5) {
+        if (!mCachedSps.empty()) {
+            sendSingleNal(mCachedSps.data(), mCachedSps.size(),
+                          rtpTimestamp, /*marker=*/false);
+        }
+        if (!mCachedPps.empty()) {
+            sendSingleNal(mCachedPps.data(), mCachedPps.size(),
+                          rtpTimestamp, /*marker=*/false);
+        }
+    }
+
+    // Marker = true only for VCL slice NALs (end of access unit).
+    const bool isVclSlice = (nalType >= 1 && nalType <= 5);
+
     if (static_cast<int>(size) + RTP_HEADER_SIZE <= RTP_MTU) {
-        sendSingleNal(nal, size, rtpTimestamp, /*marker=*/true);
+        sendSingleNal(nal, size, rtpTimestamp, /*marker=*/isVclSlice);
     } else {
-        sendFuA(nal, size, rtpTimestamp);
+        sendFuA(nal, size, rtpTimestamp);  // FU-A sets marker on its last fragment
     }
 }
 

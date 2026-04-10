@@ -1,8 +1,8 @@
 # rvc_app — Rear View Camera Streaming Service
 
-A native C++ system service that watches the `vendor.rvc.camera.active`
+A native C++ **system** service that watches the `vendor.rvc.camera.active`
 property and streams the rear camera as **H.264 over RTP/UDP** to the
-Instrument Cluster (`192.168.10.10:5004`) when the value is `"1"`.
+Instrument Cluster (`192.168.10.10:5004`) whenever the value is `"1"`.
 
 `rvc_app` is one half of a two-process architecture:
 
@@ -11,123 +11,119 @@ rvc_service  (vendor)  ── vendor.rvc.camera.active ──►  rvc_app  (syst
   VHAL gear monitor                                  Camera + encoder + RTP
 ```
 
-The split exists because `libcamera2ndk` is a system-namespace library and
-cannot be loaded by vendor binaries.  `rvc_app` runs in `/system/bin` so the
-system linker namespace resolves it without any hacks.
+**Why the split?**
+`libcamera2ndk` lives in the system linker namespace and cannot be loaded
+by vendor binaries. `rvc_app` installs to `/system/bin` (no `vendor: true`
+in `Android.bp`) so the system linker resolves it cleanly.
 
 ---
 
-## Where to place this code in the AOSP tree
+## Tree placement
 
 ```
-<AOSP_ROOT>/
-└── vendor/
-    └── brcm/
-        └── rvc-app/                 ← this folder
-            ├── Android.bp
-            ├── rvc_app.rc
-            ├── src/
-            │   ├── main.cpp
-            │   ├── CameraStreamManager.cpp
-            │   └── RtpStreamer.cpp
-            └── include/
-                ├── CameraConfig.h
-                ├── CameraStreamManager.h
-                └── RtpStreamer.h
+<AOSP_ROOT>/vendor/brcm/rvc-app/
+├── Android.bp
+├── rvc_app.rc
+├── sepolicy/
+│   ├── rvc_app.te
+│   └── file_contexts
+├── src/
+│   ├── main.cpp
+│   ├── CameraStreamManager.cpp
+│   └── RtpStreamer.cpp
+└── include/
+    ├── CameraConfig.h
+    ├── CameraStreamManager.h
+    └── RtpStreamer.h
 ```
 
-**Why not `vendor: true`?**
-`libcamera2ndk` is an App NDK library that lives in the system linker
-namespace.  Vendor binaries run in the vendor namespace and cannot access it.
-Installing `rvc_app` to `/system/bin` (the default when `vendor: true` is
-absent) keeps it in the system namespace where `libcamera2ndk` loads cleanly.
+`BoardConfig.mk` must include the sepolicy directory:
+
+```makefile
+BOARD_SEPOLICY_DIRS += vendor/brcm/rvc-app/sepolicy
+```
 
 ---
 
-## How to build
+## Build
 
 ```bash
-# Set up the AOSP build environment (once per shell session)
 source build/envsetup.sh
 lunch <your_target>
 
-# Build only this module
+# Module only (fast iteration)
 mmm vendor/brcm/rvc-app
 
-# Or by module name
-m rvc_app
-
-# Output binary lands at:
-# out/target/product/<device>/system/bin/rvc_app
+# Output
+out/target/product/<device>/system/bin/rvc_app
 ```
 
 ---
 
-## How to add this service to the device build
+## Device integration
 
 In `device/<oem>/<board>/device.mk`:
 
 ```makefile
-PRODUCT_PACKAGES += \
-    rvc_service \
-    rvc_app
+PRODUCT_PACKAGES += rvc_service rvc_app
 ```
 
-Both entries are required.  `rvc_app.rc` is installed to
-`/system/etc/init/` automatically via the `init_rc` field in `Android.bp`.
+Both are required. `rvc_app.rc` is installed to `/system/etc/init/`
+automatically via the `init_rc` field in `Android.bp`.
 
 ---
 
-## How to push and test during development (without a full flash)
+## Push and test without reflashing
+
+On RPi5, the system partition is mounted as root (`/`) — there is no
+separate `/system` mount point. Remount root as writable:
 
 ```bash
-adb root && adb remount
+adb root
+adb shell mount -o remount,rw /
 
-# Push the new binary
 adb push out/target/product/<device>/system/bin/rvc_app /system/bin/rvc_app
 
-# Push the RC file if changed
-adb push vendor/brcm/rvc-app/rvc_app.rc /system/etc/init/rvc_app.rc
-
-# Restart both services (rvc_app first so the socket exists)
-adb shell stop rvc_app
-adb shell stop rvc_service
+adb shell stop  rvc_app
 adb shell start rvc_app
-adb shell start rvc_service
 
-# Watch logs
 adb logcat -s RvcApp CameraStreamMgr RtpStreamer
 ```
 
----
-
-## How to simulate a reverse gear event
-
-Gear events are injected via `rvc_service`, which forwards them to `rvc_app`:
+For the vendor binary (`rvc_service`), `/vendor` is a separate partition:
 
 ```bash
-# Engage reverse (triggers rvc_app to open camera and stream)
+adb shell mount -o remount,rw /vendor
+adb push out/target/product/<device>/vendor/bin/rvc_service /vendor/bin/rvc_service
+```
+
+---
+
+## Simulate a reverse gear event
+
+Gear events flow through `rvc_service`, which writes the property that
+`rvc_app` watches:
+
+```bash
+# Engage reverse — rvc_service writes vendor.rvc.camera.active=1
 adb shell cmd car_service inject-vhal-event 0x11400400 8
 
-# Leave reverse (triggers rvc_app to stop stream)
+# Leave reverse — rvc_service writes vendor.rvc.camera.active=0
 adb shell cmd car_service inject-vhal-event 0x11400400 4
 ```
 
-To test `rvc_app` directly without `rvc_service`, write the property:
+To test `rvc_app` directly without `rvc_service`:
 
 ```bash
-# Start streaming
-adb shell setprop vendor.rvc.camera.active 1
-
-# Stop streaming
-adb shell setprop vendor.rvc.camera.active 0
+adb shell setprop vendor.rvc.camera.active 1   # start streaming
+adb shell setprop vendor.rvc.camera.active 0   # stop streaming
 ```
 
 ---
 
-## How to receive the stream on the Instrument Cluster
+## Receive the stream on the Instrument Cluster
 
-### GStreamer (recommended)
+### GStreamer
 
 ```bash
 gst-launch-1.0 \
@@ -136,7 +132,7 @@ gst-launch-1.0 \
   ! rtph264depay ! avdec_h264 ! videoconvert ! autovideosink
 ```
 
-### FFplay (quick test)
+### FFplay
 
 ```bash
 cat > rearview.sdp << 'EOF'
@@ -174,30 +170,27 @@ All tuneable values are in `include/CameraConfig.h`:
 ## Architecture and data flow
 
 ```
-init (rvc_app.rc)
+init  (rvc_app.rc)   class main
   └── main()
-        │  __system_property_wait("vendor.rvc.camera.active")
-        │  listen() + accept()
+        __system_property_find("vendor.rvc.camera.active")
+        __system_property_wait()  ← blocks until property changes (500ms timeout)
         │
-        │  on "start\n" from rvc_service:
-        │    CameraStreamManager::open()
-        │      RtpStreamer::start()           UDP socket → 192.168.10.10:5004
-        │      AMediaCodec (H.264 encoder, Surface input)
-        │      ACameraManager_openCamera()
-        │      ACameraCaptureSession → ANativeWindow (encoder surface)
-        │      encoderLoop() thread
-        │        AMediaCodec_dequeueOutputBuffer()
-        │          RtpStreamer::sendAnnexB()
-        │            strip start codes → NAL units
-        │            single-NAL / FU-A packetisation (RFC 3984)
-        │            sendto() UDP ──────────► 192.168.10.10:5004
+        │  value == "1"  →  CameraStreamManager::open()
+        │                      AMediaCodec (H.264 encoder, Surface input)
+        │                      ACameraManager_openCamera()
+        │                      ACameraCaptureSession → ANativeWindow (encoder surface)
+        │                      encoderLoop() thread
+        │                        AMediaCodec_dequeueOutputBuffer()
+        │                          RtpStreamer::sendAnnexB()
+        │                            strip Annex-B start codes → NAL units
+        │                            single-NAL / FU-A (RFC 3984)
+        │                            sendto() UDP ──► 192.168.10.10:5004
         │
-        │  on "stop\n" from rvc_service (or client disconnect):
-        │    CameraStreamManager::close()
-        │      teardown(): session → device → manager → codec → surface
-        │      RtpStreamer::stop()
+        │  value == "0"  →  CameraStreamManager::close()
+        │                      teardown: session → device → manager → codec → surface
+        │                      RtpStreamer::stop()
         │
-        └── accept() next connection …
+        └── loop back to __system_property_wait()
 ```
 
 ---
@@ -206,9 +199,9 @@ init (rvc_app.rc)
 
 | Symptom | Likely cause & fix |
 |---|---|
-| `rvc_app` exits immediately on start | Check logcat: `adb logcat -s RvcApp`. Normally it starts with `class main` automatically. |
-| No stream when reverse engaged | Check `rvc_service` is running: `adb logcat -s RearViewCameraSvc` should show "set vendor.rvc.camera.active=1"; check `rvc_app` logcat for "REVERSE — opening camera" |
-| `ACameraManager_openCamera failed` | Wrong `CAMERA_ID` in `CameraConfig.h`, or camera already in use by another process |
-| No UDP packets at cluster | Verify route: `adb shell ping 192.168.10.10`; check `RTP_DEST_IP` in `CameraConfig.h` |
-| Blurry / corrupted video | Increase `VIDEO_BITRATE` or check for packet loss: `tcpdump -i eth0 udp port 5004` |
-| `libcamera2ndk.so` not found | Binary was built with `vendor: true` by mistake — check `Android.bp` has no `vendor:` flag |
+| `rvc_app` never starts | Check `adb shell getprop init.svc.rvc_app`; verify `class main` is in `rvc_app.rc` |
+| Camera doesn't open when reverse engaged | Check `vendor.rvc.camera.active`: `adb shell getprop vendor.rvc.camera.active`; check `rvc_service` is running |
+| `ACameraManager_openCamera failed` | Wrong `CAMERA_ID` in `CameraConfig.h`, or camera already in use |
+| `libcamera2ndk.so` not found at runtime | Binary has `vendor: true` in `Android.bp` — remove it so it installs to `/system/bin` |
+| No UDP packets at Instrument Cluster | Verify route: `adb shell ping 192.168.10.10`; check `RTP_DEST_IP` in `CameraConfig.h` |
+| Blurry / corrupted video | Increase `VIDEO_BITRATE`; check packet loss: `tcpdump -i eth0 udp port 5004` |

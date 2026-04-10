@@ -9,8 +9,8 @@
 
 service rvc_app /system/bin/rvc_app
     class main
-    user cameraserver
+    user system
     group camera inet
     ioprio rt 4
-    writepid /dev/cpuset/camera-daemon/tasks
+    writepid /dev/cpuset/system-background/tasks
     onrestart restart rvc_app

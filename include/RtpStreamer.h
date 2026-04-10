@@ -23,6 +23,10 @@ public:
     // Send one encoder output buffer (Annex-B framed) as one or more RTP packets.
     void sendAnnexB(const uint8_t* data, size_t size, int64_t presentationTimeUs);
 
+    // Cache SPS and PPS from a MediaCodec CODEC_CONFIG Annex-B buffer.
+    // These are injected (with the matching RTP timestamp) before every IDR.
+    void cacheParameterSets(const uint8_t* annexb, size_t size);
+
 private:
     void    sendNalUnit(const uint8_t* nal, size_t size, int64_t rtpTimestamp);
     void    sendSingleNal(const uint8_t* nal, size_t size, int64_t rtpTimestamp, bool marker);
@@ -38,6 +42,10 @@ private:
     uint32_t mSsrc;
     uint16_t mSeqNum;
     uint32_t mTimestampOffset;
+
+    // Cached SPS and PPS NAL bodies (no start code) from the CODEC_CONFIG buffer.
+    std::vector<uint8_t> mCachedSps;
+    std::vector<uint8_t> mCachedPps;
 };
 
 } // namespace rearview

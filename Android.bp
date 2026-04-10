@@ -31,6 +31,9 @@ cc_binary {
         "libcutils",
         "libbase",
 
+        // Binder thread pool — required for Camera2 NDK callbacks
+        "libbinder_ndk",
+
         // Camera
         "libcamera2ndk",
         "libmediandk",
