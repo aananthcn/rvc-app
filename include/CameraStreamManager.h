@@ -11,14 +11,18 @@
 #include <media/NdkImageReader.h>
 #include <android/native_window.h>
 
+#include <gui/SurfaceComposerClient.h>
+#include <gui/Surface.h>
+#include <ui/DisplayState.h>
+
 #include <atomic>
 #include <thread>
 
 namespace rearview {
 
 // Manages the Camera2 NDK capture session and H.264 MediaCodec encoder.
-// Uses buffer-input mode: AImageReader captures YUV frames from the camera,
-// which are converted to NV12 and fed directly into the encoder input buffers.
+// Dual-output: AImageReader feeds the H.264 encoder → RTP stream; a
+// SurfaceComposerClient layer renders the same feed full-screen on the IVI.
 // Call open() when reverse is engaged, close() when leaving reverse.
 class CameraStreamManager {
 public:
@@ -34,10 +38,13 @@ public:
 private:
     bool setupEncoder();
     bool setupImageReader();
-    bool setupCameraSession();
+    bool setupDisplay();       // create full-screen SurfaceControl layer
+    bool setupCameraSession(); // registers ImageReader (and display if available) as outputs
     void encoderLoop();
     void feedEncoder(AImage* image);
     void teardown();
+    void teardownCameraOnly();  // close camera device/session — leaves encoder/image-reader intact
+    void teardownDisplayOnly(); // destroy SurfaceControl layer and display output targets
 
     // Static camera device callbacks
     static void onCameraDisconnected(void* ctx, ACameraDevice* device);
@@ -65,18 +72,25 @@ private:
     AMediaCodec*  mCodec{nullptr};
     AMediaFormat* mFormat{nullptr};
 
-    // Image reader — camera writes YUV_420_888 frames here
+    // Image reader — camera writes YUV_420_888 frames here (→ encoder → RTP)
     AImageReader*  mImageReader{nullptr};
     ANativeWindow* mReaderWindow{nullptr};
+
+    // Display layer — camera writes directly to SurfaceFlinger (→ IVI screen)
+    android::sp<android::SurfaceComposerClient> mDisplayClient;
+    android::sp<android::SurfaceControl>        mDisplaySurface;
+    android::sp<android::Surface>               mDisplayWindow;
+    ACameraOutputTarget*                        mDisplayOutputTarget{nullptr};
+    ACaptureSessionOutput*                      mDisplaySessionOutput{nullptr};
 
     // Camera
     ACameraManager*                 mCameraManager{nullptr};
     ACameraDevice*                  mCameraDevice{nullptr};
     ACameraCaptureSession*          mCaptureSession{nullptr};
     ACaptureRequest*                mCaptureRequest{nullptr};
-    ACameraOutputTarget*            mOutputTarget{nullptr};
+    ACameraOutputTarget*            mReaderOutputTarget{nullptr};
     ACaptureSessionOutputContainer* mOutputContainer{nullptr};
-    ACaptureSessionOutput*          mSessionOutput{nullptr};
+    ACaptureSessionOutput*          mReaderSessionOutput{nullptr};
 };
 
 } // namespace rearview

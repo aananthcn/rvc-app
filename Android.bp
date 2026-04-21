@@ -39,6 +39,10 @@ cc_binary {
         "libmediandk",
         "libnativewindow",
 
+        // Display layer (SurfaceComposerClient, SurfaceControl)
+        "libgui",
+        "libui",
+
         // Network (UDP socket — in libc, listed for clarity)
         "libc",
     ],

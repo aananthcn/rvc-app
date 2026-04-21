@@ -3,18 +3,82 @@
 A native C++ **system** service that watches the `vendor.rvc.camera.active`
 property and streams the rear camera as **H.264 over RTP/UDP** to the
 Instrument Cluster (`192.168.10.10:5004`) whenever the value is `"1"`.
+It also renders the live camera feed full-screen on the IVI display via a
+SurfaceComposerClient overlay layer.
 
-`rvc_app` is one half of a two-process architecture:
+`rvc_app` is part of a three-module RVC pipeline:
 
 ```
 rvc_service  (vendor)  ── vendor.rvc.camera.active ──►  rvc_app  (system)
   VHAL gear monitor                                  Camera + encoder + RTP
+                                                     + IVI display overlay
+                                          rvc_evs_shim (satisfies CarEvsService watchdog)
 ```
 
 **Why the split?**
 `libcamera2ndk` lives in the system linker namespace and cannot be loaded
 by vendor binaries. `rvc_app` installs to `/system/bin` (no `vendor: true`
 in `Android.bp`) so the system linker resolves it cleanly.
+
+---
+
+## Getting Started
+
+The RVC pipeline spans **four repositories** that must all be present in the
+AOSP tree before building. Clone each into the path shown:
+
+| Module | AOSP tree path | Repository |
+|---|---|---|
+| `rvc_service` | `vendor/brcm/rvc-service` | `<your-org>/rvc-service` |
+| `rvc_app` | `vendor/brcm/rvc-app` | `<your-org>/rvc-app` |
+| `rvc_evs_shim` | `vendor/brcm/rvc-evs-shim` | `<your-org>/rvc-evs-shim` |
+| CarServiceRpiOverlay | `device/brcm/rpi5/overlay/CarServiceRpiOverlay` | `<your-org>/CarServiceRpiOverlay` |
+
+```bash
+# From the AOSP root — clone all four into their required paths:
+git clone <your-org>/rvc-service          vendor/brcm/rvc-service
+git clone <your-org>/rvc-app              vendor/brcm/rvc-app
+git clone <your-org>/rvc-evs-shim         vendor/brcm/rvc-evs-shim
+git clone <your-org>/CarServiceRpiOverlay device/brcm/rpi5/overlay/CarServiceRpiOverlay
+```
+
+> **CarServiceRpiOverlay** overrides `config_evsCameraActivity` in AOSP's
+> CarService so that `CarEvsService` launches `rvc_evs_shim` (a no-op shim)
+> instead of `CarEvsCameraPreviewActivity` on GEAR=REVERSE. This keeps the
+> CarEvsService watchdog satisfied while leaving `/dev/video0` free for
+> `rvc_app`'s Camera2 session.
+>
+> **rvc_evs_shim** is a minimal APK (single Activity that finishes immediately)
+> installed to `/system/app`. It has no user-visible UI and exists solely to
+> satisfy the CarEvsService state machine without holding the camera.
+
+### Register in the device build
+
+In `device/brcm/rpi5/device.mk`:
+
+```makefile
+PRODUCT_PACKAGES += \
+    rvc_service \
+    rvc_app \
+    rvc_evs_shim
+
+PRODUCT_PACKAGE_OVERLAYS += device/brcm/rpi5/overlay
+```
+
+In `device/brcm/rpi5/BoardConfig.mk`:
+
+```makefile
+BOARD_SEPOLICY_DIRS += vendor/brcm/rvc-app/sepolicy
+```
+
+### Build all RVC modules
+
+```bash
+source build/envsetup.sh
+lunch <your_target>
+
+m rvc_service rvc_app rvc_evs_shim CarServiceRpiOverlay
+```
 
 ---
 
@@ -76,24 +140,54 @@ automatically via the `init_rc` field in `Android.bp`.
 ## Push and test without reflashing
 
 On RPi5, the system partition is mounted as root (`/`) — there is no
-separate `/system` mount point. Remount root as writable:
+separate `/system` mount point. Remount both partitions writable first:
 
 ```bash
 adb root
 adb shell mount -o remount,rw /
+adb shell mount -o remount,rw /vendor
+```
 
+Push all three RVC modules:
+
+```bash
+# rvc_app — native binary (system partition)
 adb push out/target/product/<device>/system/bin/rvc_app /system/bin/rvc_app
 
-adb shell stop  rvc_app
-adb shell start rvc_app
+# rvc_evs_shim — APK that satisfies CarEvsService watchdog (system partition)
+adb push out/target/product/<device>/system/app/rvc_evs_shim /system/app/rvc_evs_shim
 
+# CarServiceRpiOverlay — resource overlay redirecting EVS activity (vendor partition)
+adb push out/target/product/<device>/vendor/overlay/CarServiceRpiOverlay.apk /vendor/overlay/CarServiceRpiOverlay.apk
+```
+
+A reboot is required after pushing `rvc_evs_shim` and `CarServiceRpiOverlay` because
+PackageManager scans new APKs at boot and CarService reads the overlay at startup:
+
+```bash
+adb reboot
+```
+
+After reboot, verify all three are active:
+
+```bash
+adb shell getprop init.svc.rvc_app           # expected: running
+adb shell pm list packages | grep rvcshim    # expected: package:com.brcm.rvcshim
+adb shell cmd overlay list | grep Rpi        # CarServiceRpiOverlay should show [x]
+```
+
+To iterate on `rvc_app` only (no reboot needed):
+
+```bash
+adb shell stop rvc_app
+adb push out/target/product/<device>/system/bin/rvc_app /system/bin/rvc_app
+adb shell start rvc_app
 adb logcat -s RvcApp CameraStreamMgr RtpStreamer
 ```
 
 For the vendor binary (`rvc_service`), `/vendor` is a separate partition:
 
 ```bash
-adb shell mount -o remount,rw /vendor
 adb push out/target/product/<device>/vendor/bin/rvc_service /vendor/bin/rvc_service
 ```
 

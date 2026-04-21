@@ -3,9 +3,14 @@
 
 #include <log/log.h>
 #include <media/NdkMediaError.h>
+#include <utils/String8.h>
+#include <ui/DisplayId.h>
+#include <ui/DisplayState.h>
 
 #include <chrono>
 #include <cstring>
+
+using namespace android;
 
 namespace rearview {
 
@@ -31,7 +36,31 @@ bool CameraStreamManager::open() {
     // processes frames immediately when setRepeatingRequest fires.
     mStreaming.store(true);
 
-    if (!setupCameraSession())   { mStreaming.store(false); teardown(); return false; }
+    // Non-fatal: if display setup fails we still stream via RTP.
+    bool displayReady = setupDisplay();
+    if (!displayReady) {
+        ALOGW("CameraStreamMgr: display layer unavailable — RTP-only mode");
+    }
+
+    if (!setupCameraSession()) {
+        if (displayReady) {
+            // SurfaceControl surface may be incompatible with this Camera HAL.
+            // Tear down camera and display, then retry with RTP-only output.
+            ALOGW("CameraStreamMgr: dual-output session failed — retrying RTP-only");
+            teardownCameraOnly();
+            teardownDisplayOnly();
+            mStreaming.store(true); // onCameraError callback may have cleared it
+            if (!setupCameraSession()) {
+                mStreaming.store(false);
+                teardown();
+                return false;
+            }
+        } else {
+            mStreaming.store(false);
+            teardown();
+            return false;
+        }
+    }
 
     // Dedicated thread drains MediaCodec output and feeds RtpStreamer.
     mEncoderThread = std::thread(&CameraStreamManager::encoderLoop, this);
@@ -120,6 +149,62 @@ bool CameraStreamManager::setupImageReader() {
     return true;
 }
 
+// ── Display layer setup ───────────────────────────────────────────────────────
+// Creates a full-screen SurfaceComposerClient layer as a second camera output.
+// Camera writes frames directly into this layer; SurfaceFlinger composites it.
+
+bool CameraStreamManager::setupDisplay() {
+    // getInternalDisplayToken() was removed in Android 16.
+    const std::vector<PhysicalDisplayId> ids =
+            SurfaceComposerClient::getPhysicalDisplayIds();
+    if (ids.empty()) {
+        ALOGE("CameraStreamMgr: no physical display found");
+        return false;
+    }
+    sp<IBinder> displayToken = SurfaceComposerClient::getPhysicalDisplayToken(ids[0]);
+    if (!displayToken) {
+        ALOGE("CameraStreamMgr: getPhysicalDisplayToken failed");
+        return false;
+    }
+
+    ui::DisplayState state;
+    int dispW = VIDEO_WIDTH, dispH = VIDEO_HEIGHT; // safe fallback
+    if (SurfaceComposerClient::getDisplayState(displayToken, &state) == NO_ERROR &&
+        !state.layerStackSpaceRect.isEmpty()) {
+        dispW = state.layerStackSpaceRect.getWidth();
+        dispH = state.layerStackSpaceRect.getHeight();
+    }
+    ALOGI("CameraStreamMgr: display %dx%d, camera output %dx%d",
+          dispW, dispH, VIDEO_WIDTH, VIDEO_HEIGHT);
+
+    mDisplayClient = new SurfaceComposerClient();
+    // Create layer at camera resolution; scale to display via Transaction matrix.
+    mDisplaySurface = mDisplayClient->createSurface(
+        String8("rvc-camera-display"),
+        static_cast<uint32_t>(VIDEO_WIDTH),
+        static_cast<uint32_t>(VIDEO_HEIGHT),
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED,
+        0);
+    if (!mDisplaySurface || !mDisplaySurface->isValid()) {
+        ALOGE("CameraStreamMgr: SurfaceComposerClient::createSurface failed");
+        mDisplayClient.clear();
+        return false;
+    }
+
+    float scaleX = static_cast<float>(dispW) / VIDEO_WIDTH;
+    float scaleY = static_cast<float>(dispH) / VIDEO_HEIGHT;
+    SurfaceComposerClient::Transaction()
+        .setLayer(mDisplaySurface, INT32_MAX)
+        .setPosition(mDisplaySurface, 0.0f, 0.0f)
+        .setMatrix(mDisplaySurface, scaleX, 0.0f, 0.0f, scaleY)
+        .show(mDisplaySurface)
+        .apply();
+
+    mDisplayWindow = mDisplaySurface->getSurface();
+    ALOGI("CameraStreamMgr: display layer ready (scale %.2fx%.2f)", scaleX, scaleY);
+    return true;
+}
+
 // ── Camera session ────────────────────────────────────────────────────────────
 
 bool CameraStreamManager::setupCameraSession() {
@@ -143,14 +228,27 @@ bool CameraStreamManager::setupCameraSession() {
     }
     ALOGI("CameraStreamMgr: camera %s opened", CAMERA_ID);
 
-    // Use the AImageReader's native window as the camera output target.
-    ACameraOutputTarget_create(mReaderWindow, &mOutputTarget);
+    // Register ImageReader window (→ encoder → RTP).
+    ACameraOutputTarget_create(mReaderWindow, &mReaderOutputTarget);
+    ACaptureSessionOutput_create(mReaderWindow, &mReaderSessionOutput);
+
     ACaptureSessionOutputContainer_create(&mOutputContainer);
-    ACaptureSessionOutput_create(mReaderWindow, &mSessionOutput);
-    ACaptureSessionOutputContainer_add(mOutputContainer, mSessionOutput);
+    ACaptureSessionOutputContainer_add(mOutputContainer, mReaderSessionOutput);
+
+    // Register display layer window if available (→ IVI screen).
+    if (mDisplayWindow) {
+        ANativeWindow* displayNW = mDisplayWindow.get();
+        ACameraOutputTarget_create(displayNW, &mDisplayOutputTarget);
+        ACaptureSessionOutput_create(displayNW, &mDisplaySessionOutput);
+        ACaptureSessionOutputContainer_add(mOutputContainer, mDisplaySessionOutput);
+        ALOGI("CameraStreamMgr: dual-output session — image reader + display");
+    }
 
     ACameraDevice_createCaptureRequest(mCameraDevice, TEMPLATE_PREVIEW, &mCaptureRequest);
-    ACaptureRequest_addTarget(mCaptureRequest, mOutputTarget);
+    ACaptureRequest_addTarget(mCaptureRequest, mReaderOutputTarget);
+    if (mDisplayOutputTarget) {
+        ACaptureRequest_addTarget(mCaptureRequest, mDisplayOutputTarget);
+    }
 
     ACameraCaptureSession_stateCallbacks sessionCbs{};
     sessionCbs.context  = this;
@@ -178,7 +276,7 @@ bool CameraStreamManager::setupCameraSession() {
         return false;
     }
 
-    ALOGI("CameraStreamMgr: capture session started → image reader");
+    ALOGI("CameraStreamMgr: capture session started");
     return true;
 }
 
@@ -318,8 +416,9 @@ void CameraStreamManager::encoderLoop() {
 
 // ── Cleanup ───────────────────────────────────────────────────────────────────
 
-void CameraStreamManager::teardown() {
-    // Stop camera capture before releasing any surfaces.
+// Closes the camera session, device, and manager.
+// Leaves encoder, image reader, and display surface intact for retry.
+void CameraStreamManager::teardownCameraOnly() {
     if (mCaptureSession) {
         ACameraCaptureSession_stopRepeating(mCaptureSession);
         ACameraCaptureSession_close(mCaptureSession);
@@ -329,17 +428,25 @@ void CameraStreamManager::teardown() {
         ACaptureRequest_free(mCaptureRequest);
         mCaptureRequest = nullptr;
     }
-    if (mOutputTarget) {
-        ACameraOutputTarget_free(mOutputTarget);
-        mOutputTarget = nullptr;
+    if (mReaderOutputTarget) {
+        ACameraOutputTarget_free(mReaderOutputTarget);
+        mReaderOutputTarget = nullptr;
+    }
+    if (mDisplayOutputTarget) {
+        ACameraOutputTarget_free(mDisplayOutputTarget);
+        mDisplayOutputTarget = nullptr;
     }
     if (mOutputContainer) {
         ACaptureSessionOutputContainer_free(mOutputContainer);
         mOutputContainer = nullptr;
     }
-    if (mSessionOutput) {
-        ACaptureSessionOutput_free(mSessionOutput);
-        mSessionOutput = nullptr;
+    if (mReaderSessionOutput) {
+        ACaptureSessionOutput_free(mReaderSessionOutput);
+        mReaderSessionOutput = nullptr;
+    }
+    if (mDisplaySessionOutput) {
+        ACaptureSessionOutput_free(mDisplaySessionOutput);
+        mDisplaySessionOutput = nullptr;
     }
     if (mCameraDevice) {
         ACameraDevice_close(mCameraDevice);
@@ -349,6 +456,23 @@ void CameraStreamManager::teardown() {
         ACameraManager_delete(mCameraManager);
         mCameraManager = nullptr;
     }
+}
+
+// Destroys the SurfaceComposerClient display layer and its camera output targets.
+void CameraStreamManager::teardownDisplayOnly() {
+    if (mDisplaySurface) {
+        SurfaceComposerClient::Transaction()
+            .hide(mDisplaySurface)
+            .apply();
+        mDisplayWindow.clear();
+        mDisplaySurface.clear();
+        mDisplayClient.clear();
+    }
+}
+
+void CameraStreamManager::teardown() {
+    teardownCameraOnly();
+    teardownDisplayOnly();
 
     // Release image reader after camera is stopped.
     if (mImageReader) {

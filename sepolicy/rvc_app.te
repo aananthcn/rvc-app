@@ -17,3 +17,9 @@ allow rvc_app node:udp_socket node_bind;
 
 # Read the vendor property written by rvc_service
 get_prop(rvc_app, vendor_rvc_prop)
+
+# SurfaceFlinger access for IVI display overlay layer (SurfaceComposerClient).
+# Required so setupDisplay() can create and show a full-screen camera layer.
+binder_call(rvc_app, surfaceflinger)
+allow rvc_app surfaceflinger_service:service_manager find;
+allow rvc_app display_service:service_manager find;
